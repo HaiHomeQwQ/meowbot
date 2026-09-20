@@ -3,6 +3,15 @@ function getMeowReply() {
   return Math.floor(Math.random() * 100) === 0 ? ":3" : "meow";
 }
 
+// 统一处理 fetch 响应：非 2xx 时打印状态码和响应体，方便在 wrangler tail 里看到
+async function logIfError(label, res) {
+  if (!res.ok) {
+    const text = await res.text().catch(() => '<no body>');
+    console.error(`[${label}] failed: status=${res.status} body=${text}`);
+  }
+  return res;
+}
+
 export default {
   async fetch(request, env, ctx) {
     if (request.method !== 'POST') {
@@ -13,7 +22,7 @@ export default {
     const signature = request.headers.get('x-signature-ed25519');
     const timestamp = request.headers.get('x-signature-timestamp');
     const body = await request.text();
-    
+
     const isValidRequest = await verifyDiscordSignature(
       body,
       signature,
@@ -22,6 +31,11 @@ export default {
     );
 
     if (!isValidRequest) {
+      console.error('[verifyDiscordSignature] signature check failed', {
+        hasSignature: !!signature,
+        hasTimestamp: !!timestamp,
+        hasPublicKey: !!env.DISCORD_PUBLIC_KEY,
+      });
       return new Response('Bad request signature', { status: 401 });
     }
 
@@ -43,10 +57,19 @@ export default {
 
       const supabaseUrl = env.SUPABASE_URL;
       const supabaseKey = env.SUPABASE_KEY;
+
+      if (!supabaseUrl || !supabaseKey) {
+        console.error('[env] SUPABASE_URL or SUPABASE_KEY is missing', {
+          hasUrl: !!supabaseUrl,
+          hasKey: !!supabaseKey,
+        });
+      }
+
       const headers = {
         'apikey': supabaseKey,
         'Authorization': `Bearer ${supabaseKey}`,
-        'Content-Type': 'application/json'
+        'Content-Type': 'application/json',
+        'Prefer': 'return=representation' // 方便调试时看到写入/更新后的行
       };
 
       // --- 指令 1: /meow (含 5 分钟 CD 校验) ---
@@ -54,7 +77,8 @@ export default {
         const now = new Date();
         const queryUrl = `${supabaseUrl}/rest/v1/meow_records?user_id=eq.${userId}&guild_id=eq.${guildId}&record_month=eq.${currentMonth}&select=*`;
         const getRes = await fetch(queryUrl, { headers });
-        const records = await getRes.json();
+        await logIfError('GET meow_records', getRes);
+        const records = await getRes.json().catch(() => null);
 
         let cooldownRemaining = 0;
 
@@ -81,27 +105,35 @@ export default {
           }
 
           // 超过 5 分钟，允许 meow，更新积分和最后时间
-          ctx.waitUntil(fetch(`${supabaseUrl}/rest/v1/meow_records?id=eq.${record.id}`, {
-            method: 'PATCH',
-            headers,
-            body: JSON.stringify({
-              meows_count: record.meows_count + 1,
-              last_meow_at: now.toISOString()
+          ctx.waitUntil(
+            fetch(`${supabaseUrl}/rest/v1/meow_records?id=eq.${record.id}`, {
+              method: 'PATCH',
+              headers,
+              body: JSON.stringify({
+                meows_count: record.meows_count + 1,
+                last_meow_at: now.toISOString()
+              })
             })
-          }));
+              .then(res => logIfError('PATCH meow_records', res))
+              .catch(err => console.error('[PATCH meow_records] network error', err))
+          );
         } else {
           // 本月第一次 meow
-          ctx.waitUntil(fetch(`${supabaseUrl}/rest/v1/meow_records`, {
-            method: 'POST',
-            headers,
-            body: JSON.stringify({
-              user_id: userId,
-              guild_id: guildId,
-              record_month: currentMonth,
-              meows_count: 1,
-              last_meow_at: now.toISOString()
+          ctx.waitUntil(
+            fetch(`${supabaseUrl}/rest/v1/meow_records`, {
+              method: 'POST',
+              headers,
+              body: JSON.stringify({
+                user_id: userId,
+                guild_id: guildId,
+                record_month: currentMonth,
+                meows_count: 1,
+                last_meow_at: now.toISOString()
+              })
             })
-          }));
+              .then(res => logIfError('POST meow_records', res))
+              .catch(err => console.error('[POST meow_records] network error', err))
+          );
         }
 
         return new Response(JSON.stringify({
@@ -114,7 +146,8 @@ export default {
       if (commandName === 'points') {
         const queryUrl = `${supabaseUrl}/rest/v1/meow_records?user_id=eq.${userId}&guild_id=eq.${guildId}&record_month=eq.${currentMonth}&select=*`;
         const getRes = await fetch(queryUrl, { headers });
-        const records = await getRes.json();
+        await logIfError('GET meow_records (points)', getRes);
+        const records = await getRes.json().catch(() => null);
 
         const count = (records && records.length > 0) ? records[0].meows_count : 0;
 
@@ -128,7 +161,8 @@ export default {
       if (commandName === 'leaderboard') {
         const queryUrl = `${supabaseUrl}/rest/v1/meow_records?guild_id=eq.${guildId}&record_month=eq.${currentMonth}&order=meows_count.desc&limit=10&select=*`;
         const getRes = await fetch(queryUrl, { headers });
-        const records = await getRes.json();
+        await logIfError('GET meow_records (leaderboard)', getRes);
+        const records = await getRes.json().catch(() => null);
 
         if (!records || records.length === 0) {
           return new Response(JSON.stringify({
@@ -148,7 +182,7 @@ export default {
         const embed = {
           title: `🏆 ${currentMonth} Meow Leaderboard`,
           description: listText,
-          color: 0x2596be, 
+          color: 0x2596be,
           footer: {
             text: "meow points are reset monthly"
           }
@@ -188,6 +222,7 @@ async function verifyDiscordSignature(body, signature, timestamp, publicKey) {
       encoder.encode(timestamp + body)
     );
   } catch (e) {
+    console.error('[verifyDiscordSignature] exception', e);
     return false;
   }
 }
